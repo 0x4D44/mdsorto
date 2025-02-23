@@ -1,7 +1,7 @@
 /////////////////////
 /// MD Standup Ordering Randomization TOol - "MDSORTO" (c)(R)(TM)
 ///
-/// mdavidson - November 2023
+/// 0x4D44 - November 2023
 ///
 /// Takes a list of users, randomly shuffles them & then gives them each a minute to talk.
 /// When there's 15 seconds left, the counter goes yellow; it turns red when 5 secs left.
