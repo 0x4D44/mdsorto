@@ -9,15 +9,28 @@
 /// - 'p' pauses
 /// - 'r' restarts on the current person
 /// - 'b' goes back to previous person
-/// - 'e' gives an extra 10 seconds
-/// - 'x' removes 10 seconds
+/// - '+' or '=' gives an extra 10 seconds
+/// - '-' or '_' removes 10 seconds
 ///
 pub const APP_VERSION: &str = "MDSORTO V0.3.1";
 pub const TICK_INTERVAL_MS: u64 = 60;         // Update tick interval in millisecs
 pub const DEFAULT_TIME_EACH: f64 = 60.2;      // Default time each
-pub const DEFAULT_PREP_TIME: f64 = 30.2;  // Default initial "prep" time
+pub const DEFAULT_PREP_TIME: f64 = 30.2;      // Default initial "prep" time
 const CONF_FILE_NAME: &str = "mdsorto.ini";
 const PREP_TIME_STR: &str = "Prep time";
+
+// Configuration validation constants
+const MIN_TIME: f64 = 1.0;                    // Minimum time in seconds
+const MAX_TIME: f64 = 3600.0;                 // Maximum time (1 hour)
+const MAX_PEOPLE: usize = 100;                // Maximum number of people
+
+// UI color thresholds
+const COLOR_YELLOW_THRESHOLD: f64 = 20.0;     // Yellow warning threshold in seconds
+const COLOR_RED_THRESHOLD: f64 = 7.5;         // Red warning threshold in seconds
+const MIN_TIME_LEFT: f64 = 0.01;              // Minimum time that can be set
+
+// Time adjustment
+const TIME_ADJUSTMENT: f64 = 10.0;            // Seconds to add/remove with +/- keys
 
 use std::time::{Duration, Instant};
 #[macro_use] extern crate log;
@@ -41,6 +54,24 @@ macro_rules! vec_of_strings {
   ($($x:expr),*) => (vec![$($x.to_string()),*]);
 }
 
+/// Parse and validate a time configuration value
+fn parse_time_config(value: &str, config_name: &str, default: f64) -> f64 {
+  match value.parse::<f64>() {
+    Ok(time) if time >= MIN_TIME && time <= MAX_TIME => time,
+    Ok(time) => {
+      warn!("Config value '{}' = {} is out of valid range [{}, {}], using default {}",
+            config_name, time, MIN_TIME, MAX_TIME, default);
+      eprintln!("Warning: {} value {} out of range, using default {}", config_name, time, default);
+      default
+    }
+    Err(e) => {
+      warn!("Failed to parse config value '{}' = '{}': {}, using default {}",
+            config_name, value, e, default);
+      eprintln!("Warning: Invalid {} value '{}', using default {}", config_name, value, default);
+      default
+    }
+  }
+}
 
 #[derive(Clone, Debug)]
 pub enum Event {
@@ -105,21 +136,35 @@ impl CountdownApp<> {
 
   async fn run(&mut self) -> Result<()> {
     // Init logging
+    let log_file = File::create("mdsorto.log").unwrap_or_else(|e| {
+      eprintln!("Warning: Could not create log file: {}", e);
+      eprintln!("Continuing with terminal logging only.");
+      // Create a dummy file handle - in practice we'd handle this better
+      File::create("/dev/null").expect("Failed to open /dev/null")
+    });
+
     CombinedLogger::init(
       vec![
         TermLogger::new(LevelFilter::Warn, Config::default(), TerminalMode::Mixed, ColorChoice::Auto),
-        WriteLogger::new(LevelFilter::Info, Config::default(), File::create("mdsorto.log").unwrap()),
+        WriteLogger::new(LevelFilter::Info, Config::default(), log_file),
       ]
-    ).unwrap();
-  
+    ).unwrap_or_else(|e| {
+      eprintln!("Warning: Could not initialize logger: {}", e);
+    });
+
     info!("Logging for {} initialized (tick interval: {}ms)", APP_VERSION, TICK_INTERVAL_MS);
 
     // Load config from ini file
     info!("Reading config from {}", CONF_FILE_NAME);
-    let inimap = ini!(safe CONF_FILE_NAME).unwrap_or_else(|error| {
-      eprintln!("*** Couldn't load config file {} ({}) ***\n", CONF_FILE_NAME, APP_VERSION);
-      panic!("Error: {}", error);
-    });
+    let inimap = match ini!(safe CONF_FILE_NAME) {
+      Ok(map) => map,
+      Err(error) => {
+        eprintln!("Warning: Couldn't load config file '{}': {}", CONF_FILE_NAME, error);
+        eprintln!("Continuing with default values.");
+        info!("Using default configuration");
+        std::collections::HashMap::new()
+      }
+    };
 
     // List all the config
     for (key, value) in &inimap {
@@ -128,34 +173,51 @@ impl CountdownApp<> {
 
     info!("Checking for key 'mdsorto/timeeach'");
     if inimap.contains_key("mdsorto") {
-      if inimap["mdsorto"].contains_key("timeeach") {
-        let val = inimap["mdsorto"]["timeeach"].clone().unwrap();
-        info!("Overriding default time each to: {} seconds", val);
-        self.time_each = val.parse::<f64>().unwrap();
-        self.time_left = self.time_each;
-      }
+      if let Some(section) = inimap.get("mdsorto") {
+        // Parse timeeach with validation
+        if let Some(val) = section.get("timeeach").and_then(|v| v.as_ref()) {
+          info!("Found timeeach config: {}", val);
+          self.time_each = parse_time_config(val, "timeeach", DEFAULT_TIME_EACH);
+          self.time_left = self.time_each;
+          info!("Set time_each to: {} seconds", self.time_each);
+        }
 
-      if inimap["mdsorto"].contains_key("preptime") {
-        let val = inimap["mdsorto"]["preptime"].clone().unwrap();
-        info!("Overriding default prep time to: {} seconds", val);
-        self.prep_time = val.parse::<f64>().unwrap();
-        self.time_left = self.prep_time;
-      }
+        // Parse preptime with validation
+        if let Some(val) = section.get("preptime").and_then(|v| v.as_ref()) {
+          info!("Found preptime config: {}", val);
+          self.prep_time = parse_time_config(val, "preptime", DEFAULT_PREP_TIME);
+          self.time_left = self.prep_time;
+          info!("Set prep_time to: {} seconds", self.prep_time);
+        }
 
-      if inimap["mdsorto"].contains_key("people") {
-        self.people.clear();
-        self.people.push(PREP_TIME_STR.to_string());
-        
-        let val = inimap["mdsorto"]["people"].clone().unwrap();
-        let names = val.split(",");
-        for name in names {
-          self.people.push(name.trim().to_string());
+        // Parse people list with validation
+        if let Some(val) = section.get("people").and_then(|v| v.as_ref()) {
+          info!("Found people config: {}", val);
+          self.people.clear();
+          self.people.push(PREP_TIME_STR.to_string());
+
+          let names: Vec<String> = val.split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .take(MAX_PEOPLE)
+            .collect();
+
+          if names.is_empty() {
+            warn!("People list is empty, using defaults");
+            eprintln!("Warning: No valid names in people list, using defaults");
+          } else {
+            self.people.extend(names);
+            info!("Loaded {} people", self.people.len() - 1);
+          }
         }
       }
 
-      if self.people.is_empty() {
-        // Can't have a standup with no people, so add two people back in
-        self.people.push(PREP_TIME_STR.to_string());
+      // Ensure we have at least some people
+      if self.people.len() <= 1 {
+        info!("No people configured, adding defaults");
+        if self.people.is_empty() {
+          self.people.push(PREP_TIME_STR.to_string());
+        }
         self.people.push("Person 1".to_string());
         self.people.push("Person 2".to_string());
       }
@@ -247,12 +309,14 @@ impl CountdownApp<> {
   }
 
   fn extra10(&mut self) {
-    self.time_left += 10.0;
+    self.time_left += TIME_ADJUSTMENT;
   }
 
   fn lose10(&mut self) {
-    self.time_left -= 10.0;
-    if self.time_left < 0.01 { self.time_left = 0.01 };
+    self.time_left -= TIME_ADJUSTMENT;
+    if self.time_left < MIN_TIME_LEFT {
+      self.time_left = MIN_TIME_LEFT;
+    }
   }
 
   fn restart(&mut self) {
@@ -273,7 +337,8 @@ impl CountdownApp<> {
 
   fn next_person(&mut self) {
     self.current_person += 1;
-    if self.current_person < self.people.len().try_into().unwrap() {
+    let people_count = self.people.len() as u32;
+    if self.current_person < people_count {
       self.time_left = self.time_each;
     } else {
       self.quit();
@@ -324,19 +389,29 @@ impl CountdownApp<> {
     }
     let person: &str = &self.people[self.current_person as usize];
     let lines = vec![person.into()];
-    tui_big_text::BigTextBuilder::default().lines(lines).style(style).build().unwrap()
+    tui_big_text::BigTextBuilder::default()
+      .lines(lines)
+      .style(style)
+      .build()
   }
     
   fn timer_paragraph(&mut self) -> BigText<'_> {
     let mut style = Style::new().gray();
-    if self.state.is_running() { 
-      if self.time_left > 20.0 { style = Style::new().green() } 
-        else if self.time_left > 7.5 { style = Style::new().yellow() } 
-        else { style = Style::new().red() };
-    };
+    if self.state.is_running() {
+      if self.time_left > COLOR_YELLOW_THRESHOLD {
+        style = Style::new().green();
+      } else if self.time_left > COLOR_RED_THRESHOLD {
+        style = Style::new().yellow();
+      } else {
+        style = Style::new().red();
+      }
+    }
     let duration = self.format_timeleft();
     let lines = vec![duration.into()];
-    tui_big_text::BigTextBuilder::default().lines(lines).style(style).build().unwrap()
+    tui_big_text::BigTextBuilder::default()
+      .lines(lines)
+      .style(style)
+      .build()
   }
 
   fn people_list(&mut self) -> Paragraph<'_> {
@@ -442,18 +517,24 @@ impl Tui {
             match maybe_event {
               Some(Ok(crossterm::event::Event::Key(key))) => {
                 if key.kind == crossterm::event::KeyEventKind::Press {
-                    _event_tx.send(Event::Key(key)).unwrap();
+                    if let Err(e) = _event_tx.send(Event::Key(key)) {
+                      log::error!("Failed to send key event: {}", e);
+                    }
                 }
               }
               Some(Ok(_)) => { }
               Some(Err(_)) => {
-                _event_tx.send(Event::Error).unwrap();
+                if let Err(e) = _event_tx.send(Event::Error) {
+                  log::error!("Failed to send error event: {}", e);
+                }
               }
               None => {},
             }
           },
           _ = delay => {
-              _event_tx.send(Event::Tick).unwrap();
+              if let Err(e) = _event_tx.send(Event::Tick) {
+                log::error!("Failed to send tick event: {}", e);
+              }
           },
         }
       }
@@ -477,6 +558,206 @@ impl std::ops::DerefMut for Tui {
 
 impl Drop for Tui {
   fn drop(&mut self) {
-    self.exit().unwrap();
+    if let Err(e) = self.exit() {
+      eprintln!("Error during cleanup: {}", e);
+      // Don't panic in Drop - just log the error
+    }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn test_default_app_creation() {
+    let app = CountdownApp::new();
+    assert_eq!(app.state, AppState::Paused);
+    assert_eq!(app.current_person, 0);
+    assert_eq!(app.time_each, DEFAULT_TIME_EACH);
+    assert_eq!(app.prep_time, DEFAULT_PREP_TIME);
+    assert!(app.people.len() >= 1); // At least prep time entry
+  }
+
+  #[test]
+  fn test_extra10() {
+    let mut app = CountdownApp::new();
+    app.time_left = 30.0;
+    app.extra10();
+    assert_eq!(app.time_left, 30.0 + TIME_ADJUSTMENT);
+  }
+
+  #[test]
+  fn test_lose10() {
+    let mut app = CountdownApp::new();
+    app.time_left = 30.0;
+    app.lose10();
+    assert_eq!(app.time_left, 30.0 - TIME_ADJUSTMENT);
+  }
+
+  #[test]
+  fn test_lose10_minimum() {
+    let mut app = CountdownApp::new();
+    app.time_left = 5.0;
+    app.lose10(); // 5 - 10 = -5, should clamp to MIN_TIME_LEFT
+    assert_eq!(app.time_left, MIN_TIME_LEFT);
+  }
+
+  #[test]
+  fn test_back_at_start() {
+    let mut app = CountdownApp::new();
+    app.current_person = 0;
+    let initial = app.current_person;
+    app.back();
+    assert_eq!(app.current_person, initial); // Should not go negative
+  }
+
+  #[test]
+  fn test_back_from_second_person() {
+    let mut app = CountdownApp::new();
+    app.current_person = 2;
+    app.time_left = 10.0;
+    app.back();
+    assert_eq!(app.current_person, 1);
+    assert_eq!(app.time_left, app.time_each); // Should reset to time_each
+  }
+
+  #[test]
+  fn test_back_to_prep_time() {
+    let mut app = CountdownApp::new();
+    app.current_person = 1;
+    app.time_left = 10.0;
+    app.back();
+    assert_eq!(app.current_person, 0);
+    assert_eq!(app.time_left, app.prep_time); // Should reset to prep_time
+  }
+
+  #[test]
+  fn test_next_person_advances() {
+    let mut app = CountdownApp::new();
+    let initial = app.current_person;
+    app.next_person();
+    assert_eq!(app.current_person, initial + 1);
+    assert_eq!(app.time_left, app.time_each);
+  }
+
+  #[test]
+  fn test_next_person_quits_at_end() {
+    let mut app = CountdownApp::new();
+    app.current_person = (app.people.len() - 1) as u32;
+    app.next_person();
+    assert_eq!(app.state, AppState::Quitting);
+  }
+
+  #[test]
+  fn test_restart() {
+    let mut app = CountdownApp::new();
+    app.time_left = 10.0;
+    app.restart();
+    assert_eq!(app.time_left, app.time_each);
+  }
+
+  #[test]
+  fn test_pause_unpause() {
+    let mut app = CountdownApp::new();
+    assert_eq!(app.state, AppState::Paused);
+
+    app.unpause();
+    assert_eq!(app.state, AppState::Running);
+
+    app.pause();
+    assert_eq!(app.state, AppState::Paused);
+  }
+
+  #[test]
+  fn test_pausetoggle() {
+    let mut app = CountdownApp::new();
+    assert_eq!(app.state, AppState::Paused);
+
+    app.pausetoggle();
+    assert_eq!(app.state, AppState::Running);
+
+    app.pausetoggle();
+    assert_eq!(app.state, AppState::Paused);
+  }
+
+  #[test]
+  fn test_quit() {
+    let mut app = CountdownApp::new();
+    app.quit();
+    assert_eq!(app.state, AppState::Quitting);
+  }
+
+  #[test]
+  fn test_start_or_next_when_paused() {
+    let mut app = CountdownApp::new();
+    assert_eq!(app.state, AppState::Paused);
+    app.start_or_next();
+    assert_eq!(app.state, AppState::Running);
+  }
+
+  #[test]
+  fn test_start_or_next_when_running() {
+    let mut app = CountdownApp::new();
+    app.state = AppState::Running;
+    let initial_person = app.current_person;
+    app.start_or_next();
+    assert_eq!(app.current_person, initial_person + 1);
+  }
+
+  #[test]
+  fn test_format_timeleft() {
+    let mut app = CountdownApp::new();
+
+    app.time_left = 90.5;
+    assert_eq!(app.format_timeleft(), "01:30.5");
+
+    app.time_left = 125.3;
+    assert_eq!(app.format_timeleft(), "02:05.3");
+
+    app.time_left = 5.7;
+    assert_eq!(app.format_timeleft(), "00:05.7");
+  }
+
+  #[test]
+  fn test_parse_time_config_valid() {
+    let result = parse_time_config("45.5", "test", DEFAULT_TIME_EACH);
+    assert_eq!(result, 45.5);
+  }
+
+  #[test]
+  fn test_parse_time_config_too_low() {
+    let result = parse_time_config("0.5", "test", DEFAULT_TIME_EACH);
+    assert_eq!(result, DEFAULT_TIME_EACH); // Should use default
+  }
+
+  #[test]
+  fn test_parse_time_config_too_high() {
+    let result = parse_time_config("5000.0", "test", DEFAULT_TIME_EACH);
+    assert_eq!(result, DEFAULT_TIME_EACH); // Should use default
+  }
+
+  #[test]
+  fn test_parse_time_config_invalid() {
+    let result = parse_time_config("not_a_number", "test", DEFAULT_TIME_EACH);
+    assert_eq!(result, DEFAULT_TIME_EACH); // Should use default
+  }
+
+  #[test]
+  fn test_parse_time_config_negative() {
+    let result = parse_time_config("-10.0", "test", DEFAULT_TIME_EACH);
+    assert_eq!(result, DEFAULT_TIME_EACH); // Should use default
+  }
+
+  #[test]
+  fn test_parse_time_config_at_min_boundary() {
+    let result = parse_time_config("1.0", "test", DEFAULT_TIME_EACH);
+    assert_eq!(result, 1.0); // MIN_TIME, should be accepted
+  }
+
+  #[test]
+  fn test_parse_time_config_at_max_boundary() {
+    let result = parse_time_config("3600.0", "test", DEFAULT_TIME_EACH);
+    assert_eq!(result, 3600.0); // MAX_TIME, should be accepted
   }
 }
